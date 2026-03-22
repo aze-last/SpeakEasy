@@ -1,0 +1,12 @@
+node_modules/
+.expo/
+backend/venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+backend.stdout.log
+backend.stderr.log
+backend_verify.stdout.log
+backend_verify.stderr.log

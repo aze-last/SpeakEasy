@@ -1,0 +1,35 @@
+{
+  "expo": {
+    "name": "SpeakEasy",
+    "slug": "speakeasy",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "backgroundColor": "#0A0A0F"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#0A0A0F"
+      },
+      "permissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_EXTERNAL_STORAGE"
+      ],
+      "package": "com.speakeasy.app"
+    },
+    "ios": {
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "SpeakEasy needs microphone access to record teacher feedback."
+      }
+    },
+    "plugins": [
+      [
+        "expo-av",
+        {
+          "microphonePermission": "SpeakEasy needs microphone access to record teacher feedback."
+        }
+      ]
+    ]
+  }
+}
