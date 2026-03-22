@@ -4,6 +4,7 @@ import {
   Alert,
   Animated,
   Dimensions,
+  Platform,
   SafeAreaView,
   ScrollView,
   StatusBar,
@@ -14,11 +15,20 @@ import {
 } from "react-native";
 import { Audio } from "expo-av";
 import * as DocumentPicker from "expo-document-picker";
+import * as FileSystem from "expo-file-system/legacy";
 
 const SERVER_URL = "http://192.168.254.194:8000";
 const SERVER_HEALTH_TIMEOUT_MS = 5000;
 const SERVER_BOOT_TIMEOUT_MS = 60000;
 const SERVER_RETRY_DELAY_MS = 3000;
+const TRANSCRIBE_AND_SUMMARIZE_TIMEOUT_MS = 30 * 60 * 1000;
+const HISTORY_FILE_URI = FileSystem.documentDirectory
+  ? `${FileSystem.documentDirectory}speak-easy-history.json`
+  : null;
+const AUDIO_HISTORY_DIR_URI = FileSystem.documentDirectory
+  ? `${FileSystem.documentDirectory}speak-easy-audio`
+  : null;
+const MAX_HISTORY_ITEMS = 20;
 
 const theme = {
   bg: "#0A0A0F",
@@ -52,6 +62,25 @@ function formatTimestamp(seconds) {
   const remainingSeconds = total % 60;
 
   return `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
+}
+
+function formatHistoryDate(value) {
+  if (!value) {
+    return "Recent";
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "Recent";
+  }
+
+  return date.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 function getLanguageLabel(language) {
@@ -100,8 +129,28 @@ function normalizeActionItems(items) {
   return [];
 }
 
+function normalizeKeyPoints(items) {
+  return normalizeActionItems(items);
+}
+
 function normalizeErrorMessage(error) {
+  const errorName = String(error?.name || "");
+  const message = String(error?.message || "");
+  const lowerMessage = message.toLowerCase();
   const detail = error?.response?.data?.detail;
+
+  if (
+    errorName === "AbortError" ||
+    lowerMessage.includes("abort") ||
+    lowerMessage.includes("timed out") ||
+    lowerMessage.includes("timeout")
+  ) {
+    return (
+      "The app stopped waiting for the transcription request. " +
+      "Large pre-recorded files can take several minutes on the local backend. " +
+      "Reload the app and try again with the updated longer timeout."
+    );
+  }
 
   if (Array.isArray(detail)) {
     return detail.join("\n");
@@ -168,6 +217,118 @@ function getResponseErrorMessage(payload, status) {
   }
 
   return `The server returned ${status}.`;
+}
+
+function sanitizeFilename(value) {
+  const normalized = String(value || "recording")
+    .replace(/\.[^/.]+$/, "")
+    .replace(/[^a-zA-Z0-9-_]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+
+  return normalized || "recording";
+}
+
+async function ensureHistoryAudioDirectory() {
+  if (!AUDIO_HISTORY_DIR_URI) {
+    return null;
+  }
+
+  const info = await FileSystem.getInfoAsync(AUDIO_HISTORY_DIR_URI);
+
+  if (!info.exists) {
+    await FileSystem.makeDirectoryAsync(AUDIO_HISTORY_DIR_URI, { intermediates: true });
+  }
+
+  return AUDIO_HISTORY_DIR_URI;
+}
+
+async function persistAudioFile(sourceUri, filename) {
+  if (!sourceUri || !AUDIO_HISTORY_DIR_URI) {
+    return null;
+  }
+
+  const directory = await ensureHistoryAudioDirectory();
+  const extension = String(filename || "recording.m4a").split(".").pop()?.toLowerCase() || "m4a";
+  const safeBaseName = sanitizeFilename(filename);
+  const targetUri = `${directory}/${safeBaseName}-${Date.now()}.${extension}`;
+
+  await FileSystem.copyAsync({
+    from: sourceUri,
+    to: targetUri,
+  });
+
+  return targetUri;
+}
+
+function removeTrimmedHistoryAudio(previousItems, nextItems) {
+  const nextIds = new Set(nextItems.map((item) => item.id));
+
+  previousItems
+    .filter((item) => !nextIds.has(item.id) && item.audioUri)
+    .forEach((item) => {
+      FileSystem.deleteAsync(item.audioUri, { idempotent: true }).catch(() => undefined);
+    });
+}
+
+function createHistoryEntry(result, filename, audioUri = null) {
+  const transcription = result?.transcription || {};
+  const summary = result?.summary || {};
+
+  return {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    createdAt: new Date().toISOString(),
+    filename: filename || "Untitled recording",
+    audioUri,
+    transcription: {
+      text: transcription.text || "",
+      language: transcription.language || "",
+      duration: Number(transcription.duration || 0),
+      segments: Array.isArray(transcription.segments) ? transcription.segments : [],
+    },
+    summary: {
+      text: summary.text || "",
+      key_points: normalizeKeyPoints(summary.key_points),
+      action_items: normalizeActionItems(summary.action_items),
+    },
+  };
+}
+
+function resultFromHistoryItem(item) {
+  return {
+    audioUri: item?.audioUri || null,
+    filename: item?.filename || "Untitled recording",
+    transcription: item?.transcription || {},
+    summary: item?.summary || {},
+  };
+}
+
+async function loadHistoryEntries() {
+  if (!HISTORY_FILE_URI) {
+    return [];
+  }
+
+  try {
+    const info = await FileSystem.getInfoAsync(HISTORY_FILE_URI);
+
+    if (!info.exists) {
+      return [];
+    }
+
+    const raw = await FileSystem.readAsStringAsync(HISTORY_FILE_URI);
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveHistoryEntries(items) {
+  if (!HISTORY_FILE_URI) {
+    return;
+  }
+
+  await FileSystem.writeAsStringAsync(HISTORY_FILE_URI, JSON.stringify(items));
 }
 
 function ProcessingScreen({ step }) {
@@ -243,8 +404,91 @@ function ProcessingScreen({ step }) {
 function ResultScreen({ result, onBack }) {
   const transcription = result?.transcription || {};
   const summary = result?.summary || {};
+  const keyPoints = normalizeKeyPoints(summary.key_points);
   const actionItems = normalizeActionItems(summary.action_items);
   const segments = Array.isArray(transcription.segments) ? transcription.segments : [];
+  const [isPlayingAudio, setIsPlayingAudio] = useState(false);
+  const [isLoadingAudio, setIsLoadingAudio] = useState(false);
+  const soundRef = useRef(null);
+  const hasSavedAudio = Boolean(result?.audioUri);
+
+  useEffect(() => {
+    const activeSound = soundRef.current;
+    soundRef.current = null;
+    setIsPlayingAudio(false);
+    setIsLoadingAudio(false);
+
+    if (activeSound) {
+      activeSound.unloadAsync().catch(() => undefined);
+    }
+  }, [result?.audioUri]);
+
+  useEffect(() => {
+    return () => {
+      if (soundRef.current) {
+        soundRef.current.unloadAsync().catch(() => undefined);
+        soundRef.current = null;
+      }
+    };
+  }, []);
+
+  const handlePlaybackStatusUpdate = (status) => {
+    if (!status.isLoaded) {
+      if (status.error) {
+        setIsPlayingAudio(false);
+        setIsLoadingAudio(false);
+      }
+      return;
+    }
+
+    setIsLoadingAudio(false);
+    setIsPlayingAudio(status.isPlaying);
+
+    if (status.didJustFinish) {
+      const finishedSound = soundRef.current;
+      soundRef.current = null;
+      setIsPlayingAudio(false);
+      finishedSound?.unloadAsync().catch(() => undefined);
+    }
+  };
+
+  const toggleAudioPlayback = async () => {
+    if (!hasSavedAudio || isLoadingAudio) {
+      return;
+    }
+
+    try {
+      if (soundRef.current) {
+        const activeSound = soundRef.current;
+        soundRef.current = null;
+        setIsPlayingAudio(false);
+        await activeSound.stopAsync().catch(() => undefined);
+        await activeSound.unloadAsync().catch(() => undefined);
+        return;
+      }
+
+      setIsLoadingAudio(true);
+
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        playThroughEarpieceAndroid: false,
+        staysActiveInBackground: false,
+      });
+
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: result.audioUri },
+        { shouldPlay: true },
+        handlePlaybackStatusUpdate
+      );
+
+      soundRef.current = sound;
+    } catch (error) {
+      setIsLoadingAudio(false);
+      setIsPlayingAudio(false);
+      Alert.alert("Playback error", `Could not play saved audio.\n\n${normalizeErrorMessage(error)}`);
+    }
+  };
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -270,6 +514,28 @@ function ResultScreen({ result, onBack }) {
           </View>
         </View>
 
+        {hasSavedAudio ? (
+          <TouchableOpacity
+            style={styles.playbackButton}
+            onPress={toggleAudioPlayback}
+            activeOpacity={0.85}
+          >
+            <Text style={styles.playbackButtonText}>
+              {isLoadingAudio
+                ? "Loading audio..."
+                : isPlayingAudio
+                  ? "Stop saved audio"
+                  : "Play saved audio"}
+            </Text>
+          </TouchableOpacity>
+        ) : (
+          <View style={styles.playbackNotice}>
+            <Text style={styles.playbackNoticeText}>
+              Saved audio replay is available for new recordings from this update onward.
+            </Text>
+          </View>
+        )}
+
         <View style={styles.resultCard}>
           <View style={styles.cardHeader}>
             <View style={styles.cardMarker}>
@@ -281,6 +547,25 @@ function ResultScreen({ result, onBack }) {
             {summary.text?.trim() || "No summary was returned by the server."}
           </Text>
         </View>
+
+        {keyPoints.length > 0 && (
+          <View style={styles.resultCard}>
+            <View style={styles.cardHeader}>
+              <View style={styles.cardMarker}>
+                <Text style={styles.cardMarkerText}>KP</Text>
+              </View>
+              <Text style={styles.cardTitle}>Key points</Text>
+            </View>
+            <View style={styles.actionList}>
+              {keyPoints.map((item, index) => (
+                <View key={`${item}-${index}`} style={styles.actionRow}>
+                  <View style={styles.actionDot} />
+                  <Text style={styles.actionText}>{item}</Text>
+                </View>
+              ))}
+            </View>
+          </View>
+        )}
 
         {actionItems.length > 0 && (
           <View style={styles.resultCard}>
@@ -345,6 +630,7 @@ export default function App() {
   const [processingStep, setProcessingStep] = useState("");
   const [recordingDuration, setRecordingDuration] = useState(0);
   const [result, setResult] = useState(null);
+  const [history, setHistory] = useState([]);
 
   const recordingRef = useRef(null);
   const timerRef = useRef(null);
@@ -355,6 +641,8 @@ export default function App() {
   const windowWidth = Dimensions.get("window").width;
   const recordButtonSize = Math.min(windowWidth * 0.5, 188);
   const recordInnerSize = Math.round(recordButtonSize * 0.72);
+  const androidTopInset = Platform.OS === "android" ? StatusBar.currentHeight || 0 : 0;
+  const topPadding = Math.max(18, androidTopInset + 12);
 
   const stopTimer = () => {
     if (timerRef.current) {
@@ -418,6 +706,22 @@ export default function App() {
     return undefined;
   }, [isRecording, pulseAnim]);
 
+  useEffect(() => {
+    let isActive = true;
+
+    loadHistoryEntries()
+      .then((items) => {
+        if (isActive) {
+          setHistory(items);
+        }
+      })
+      .catch(() => undefined);
+
+    return () => {
+      isActive = false;
+    };
+  }, []);
+
   const processAudio = async (uri, filename) => {
     setResult(null);
     setScreen("home");
@@ -475,7 +779,7 @@ export default function App() {
           method: "POST",
           body: formData,
         },
-        300000
+        TRANSCRIBE_AND_SUMMARIZE_TIMEOUT_MS
       );
 
       const responseData = await readResponseBody(response);
@@ -492,7 +796,21 @@ export default function App() {
       await new Promise((resolve) => setTimeout(resolve, 250));
       setProcessingStep("Preparing results");
 
-      setResult(responseData);
+      const savedAudioUri = await persistAudioFile(uri, filename).catch(() => null);
+      const resultPayload = {
+        ...responseData,
+        audioUri: savedAudioUri,
+        filename,
+      };
+      const historyEntry = createHistoryEntry(resultPayload, filename, savedAudioUri);
+
+      setHistory((current) => {
+        const next = [historyEntry, ...current].slice(0, MAX_HISTORY_ITEMS);
+        removeTrimmedHistoryAudio(current, next);
+        saveHistoryEntries(next).catch(() => undefined);
+        return next;
+      });
+      setResult(resultPayload);
       setScreen("result");
       setRecordingDuration(0);
     } catch (error) {
@@ -614,6 +932,11 @@ export default function App() {
     setScreen("home");
   };
 
+  const openHistoryItem = (item) => {
+    setResult(resultFromHistoryItem(item));
+    setScreen("result");
+  };
+
   if (isProcessing) {
     return <ProcessingScreen step={processingStep} />;
   }
@@ -625,117 +948,190 @@ export default function App() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle="light-content" backgroundColor={theme.bg} />
-      <Animated.View style={[styles.container, { opacity: fadeAnim }]}>
-        <View style={styles.heroCard}>
-          <View style={styles.headerRow}>
-            <View style={styles.brandRow}>
-              <View style={styles.brandDot} />
-              <Text style={styles.brandText}>SpeakEasy</Text>
+      <ScrollView
+        style={styles.homeScroll}
+        contentContainerStyle={[styles.container, { paddingTop: topPadding }]}
+        showsVerticalScrollIndicator={false}
+      >
+        <Animated.View style={{ opacity: fadeAnim }}>
+          <View style={styles.heroCard}>
+            <View style={styles.headerRow}>
+              <View style={styles.brandRow}>
+                <View style={styles.brandDot} />
+                <Text style={styles.brandText}>SpeakEasy</Text>
+              </View>
+              <View style={styles.languagePill}>
+                <Text style={styles.languagePillText}>EN TL CEB</Text>
+              </View>
             </View>
-            <View style={styles.languagePill}>
-              <Text style={styles.languagePillText}>EN TL CEB</Text>
-            </View>
+
+            <Text style={styles.heroTitle}>Capture feedback fast</Text>
+            <Text style={styles.heroSubtitle}>
+              Record your teacher&apos;s feedback, then get a clean transcript, summary, and action items in one place.
+            </Text>
           </View>
 
-          <Text style={styles.heroTitle}>Capture feedback fast</Text>
-          <Text style={styles.heroSubtitle}>
-            Record your teacher's feedback, then get a clean transcript, summary, and action items in one place.
-          </Text>
-        </View>
-
-        <View style={styles.recordSection}>
-          <Animated.View style={{ transform: [{ scale: pulseAnim }] }}>
-            <TouchableOpacity
-              style={[
-                styles.recordButton,
-                {
-                  width: recordButtonSize,
-                  height: recordButtonSize,
-                  borderRadius: recordButtonSize / 2,
-                },
-                isRecording && styles.recordButtonActive,
-              ]}
-              onPress={isRecording ? stopRecording : startRecording}
-              activeOpacity={0.9}
-              disabled={isProcessing}
-            >
-              <View
-                style={[
-                  styles.recordInner,
-                  {
-                    width: recordInnerSize,
-                    height: recordInnerSize,
-                    borderRadius: recordInnerSize / 2,
-                  },
-                  isRecording && styles.recordInnerActive,
-                ]}
-              >
-                {isRecording ? (
-                  <View style={styles.stopIcon} />
-                ) : (
-                  <View style={styles.micGlyph}>
-                    <View style={styles.micHead} />
-                    <View style={styles.micStem} />
-                    <View style={styles.micBase} />
+          <View style={styles.recordPanel}>
+            <Text style={styles.sectionEyebrow}>Quick capture</Text>
+            <View style={styles.recordSection}>
+              <Animated.View style={{ transform: [{ scale: pulseAnim }] }}>
+                <TouchableOpacity
+                  style={[
+                    styles.recordButton,
+                    {
+                      width: recordButtonSize,
+                      height: recordButtonSize,
+                      borderRadius: recordButtonSize / 2,
+                    },
+                    isRecording && styles.recordButtonActive,
+                  ]}
+                  onPress={isRecording ? stopRecording : startRecording}
+                  activeOpacity={0.9}
+                  disabled={isProcessing}
+                >
+                  <View
+                    style={[
+                      styles.recordInner,
+                      {
+                        width: recordInnerSize,
+                        height: recordInnerSize,
+                        borderRadius: recordInnerSize / 2,
+                      },
+                      isRecording && styles.recordInnerActive,
+                    ]}
+                  >
+                    {isRecording ? (
+                      <View style={styles.stopIcon} />
+                    ) : (
+                      <View style={styles.micGlyph}>
+                        <View style={styles.micHead} />
+                        <View style={styles.micStem} />
+                        <View style={styles.micBase} />
+                      </View>
+                    )}
                   </View>
-                )}
-              </View>
-            </TouchableOpacity>
-          </Animated.View>
+                </TouchableOpacity>
+              </Animated.View>
 
-          {isRecording ? (
-            <View style={styles.recordingInfo}>
-              <View style={styles.liveRow}>
-                <View style={styles.liveDot} />
-                <Text style={styles.liveLabel}>Recording live</Text>
-              </View>
-              <Text style={styles.timerText}>{formatDuration(recordingDuration)}</Text>
-              <Text style={styles.recordHint}>Tap the button again to stop and process</Text>
+              {isRecording ? (
+                <View style={styles.recordingInfo}>
+                  <View style={styles.liveRow}>
+                    <View style={styles.liveDot} />
+                    <Text style={styles.liveLabel}>Recording live</Text>
+                  </View>
+                  <Text style={styles.timerText}>{formatDuration(recordingDuration)}</Text>
+                  <Text style={styles.recordHint}>Tap the button again to stop and process</Text>
+                </View>
+              ) : (
+                <View style={styles.recordingInfo}>
+                  <Text style={styles.recordIdleTitle}>Tap to start recording</Text>
+                  <Text style={styles.recordHint}>
+                    The button now stays lower in the safe touch zone for easier tapping.
+                  </Text>
+                </View>
+              )}
             </View>
-          ) : (
-            <View style={styles.recordingInfo}>
-              <Text style={styles.recordIdleTitle}>Tap to start recording</Text>
-              <Text style={styles.recordHint}>Best results come from a quiet room and clear speech.</Text>
+          </View>
+
+          <View style={styles.dividerRow}>
+            <View style={styles.dividerLine} />
+            <Text style={styles.dividerText}>or</Text>
+            <View style={styles.dividerLine} />
+          </View>
+
+          <TouchableOpacity
+            style={[styles.uploadCard, isRecording && styles.uploadCardDisabled]}
+            onPress={pickFile}
+            activeOpacity={0.85}
+            disabled={isRecording || isProcessing}
+          >
+            <View style={styles.uploadBadge}>
+              <Text style={styles.uploadBadgeText}>UP</Text>
             </View>
-          )}
-        </View>
+            <View style={styles.uploadCopy}>
+              <Text style={styles.uploadTitle}>Upload audio or video</Text>
+              <Text style={styles.uploadSubtitle}>MP3, MP4, M4A, WAV, and OGG are supported.</Text>
+            </View>
+          </TouchableOpacity>
 
-        <View style={styles.dividerRow}>
-          <View style={styles.dividerLine} />
-          <Text style={styles.dividerText}>or</Text>
-          <View style={styles.dividerLine} />
-        </View>
+          <View style={styles.historyCard}>
+            <View style={styles.historyHeader}>
+              <View>
+                <Text style={styles.historyTitle}>Recording history</Text>
+                <Text style={styles.historySubtitle}>
+                  Reopen older transcripts, summaries, and action items.
+                </Text>
+              </View>
+              <View style={styles.historyCountBadge}>
+                <Text style={styles.historyCountText}>{history.length}</Text>
+              </View>
+            </View>
 
-        <TouchableOpacity
-          style={[styles.uploadCard, isRecording && styles.uploadCardDisabled]}
-          onPress={pickFile}
-          activeOpacity={0.85}
-          disabled={isRecording || isProcessing}
-        >
-          <View style={styles.uploadBadge}>
-            <Text style={styles.uploadBadgeText}>UP</Text>
-          </View>
-          <View style={styles.uploadCopy}>
-            <Text style={styles.uploadTitle}>Upload audio or video</Text>
-            <Text style={styles.uploadSubtitle}>MP3, MP4, M4A, WAV, and OGG are supported.</Text>
-          </View>
-        </TouchableOpacity>
+            {history.length === 0 ? (
+              <View style={styles.historyEmptyState}>
+                <Text style={styles.historyEmptyTitle}>No recordings yet</Text>
+                <Text style={styles.historyEmptyText}>
+                  After each processed recording, the transcript and summary will appear here.
+                </Text>
+              </View>
+            ) : (
+              <View style={styles.historyList}>
+                {history.map((item) => (
+                  <TouchableOpacity
+                    key={item.id}
+                    style={styles.historyRow}
+                    onPress={() => openHistoryItem(item)}
+                    activeOpacity={0.88}
+                  >
+                    <View style={styles.historyRowTop}>
+                      <Text style={styles.historyFilename} numberOfLines={1}>
+                        {item.filename || "Recording"}
+                      </Text>
+                      <Text style={styles.historyDate}>{formatHistoryDate(item.createdAt)}</Text>
+                    </View>
 
-        <View style={styles.infoGrid}>
-          <View style={styles.infoCard}>
-            <Text style={styles.infoCardLabel}>Private</Text>
-            <Text style={styles.infoCardValue}>Runs on your PC</Text>
-          </View>
-          <View style={styles.infoCard}>
-            <Text style={styles.infoCardLabel}>Smart</Text>
-            <Text style={styles.infoCardValue}>Transcript plus summary</Text>
-          </View>
-        </View>
+                    <View style={styles.historyMetaRow}>
+                      <View style={styles.historyMetaBadge}>
+                        <Text style={styles.historyMetaText}>
+                          {getLanguageLabel(item?.transcription?.language)}
+                        </Text>
+                      </View>
+                      <View style={styles.historyMetaBadge}>
+                        <Text style={styles.historyMetaText}>
+                          {formatDuration(Math.round(item?.transcription?.duration || 0))}
+                        </Text>
+                      </View>
+                    </View>
 
-        <Text style={styles.footerNote}>
-          Run `start_backend.bat` first, then wait around 45 seconds for the local server to finish loading Whisper. If your PC IP changed, update `SERVER_URL` in App.js before recording.
-        </Text>
-      </Animated.View>
+                    <Text style={styles.historyPreview} numberOfLines={2}>
+                      {item?.transcription?.text?.trim() || "Transcript will appear here once speech is detected."}
+                    </Text>
+
+                    <Text style={styles.historySummaryPreview} numberOfLines={2}>
+                      {item?.summary?.text?.trim() || "Summary unavailable for this recording."}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            )}
+          </View>
+
+          <View style={styles.infoGrid}>
+            <View style={styles.infoCard}>
+              <Text style={styles.infoCardLabel}>Private</Text>
+              <Text style={styles.infoCardValue}>Runs on your PC</Text>
+            </View>
+            <View style={styles.infoCard}>
+              <Text style={styles.infoCardLabel}>Smart</Text>
+              <Text style={styles.infoCardValue}>Transcript plus summary</Text>
+            </View>
+          </View>
+
+          <Text style={styles.footerNote}>
+            Run `start_backend.bat` first, then wait around 45 seconds for the local server to finish loading Whisper. If your PC IP changed, update `SERVER_URL` in App.js before recording.
+          </Text>
+        </Animated.View>
+      </ScrollView>
     </SafeAreaView>
   );
 }
@@ -746,9 +1142,11 @@ const styles = StyleSheet.create({
     backgroundColor: theme.bg,
   },
   container: {
-    flex: 1,
     paddingHorizontal: 22,
-    paddingTop: 18,
+    paddingBottom: 34,
+  },
+  homeScroll: {
+    flex: 1,
   },
   heroCard: {
     backgroundColor: theme.surface,
@@ -807,9 +1205,28 @@ const styles = StyleSheet.create({
     fontSize: 15,
     lineHeight: 22,
   },
+  recordPanel: {
+    backgroundColor: theme.surface,
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: 24,
+    paddingHorizontal: 18,
+    paddingTop: 16,
+    paddingBottom: 22,
+    marginBottom: 22,
+  },
+  sectionEyebrow: {
+    color: theme.textMuted,
+    fontSize: 11,
+    fontWeight: "700",
+    textTransform: "uppercase",
+    letterSpacing: 1.2,
+    marginBottom: 14,
+    textAlign: "center",
+  },
   recordSection: {
     alignItems: "center",
-    marginBottom: 26,
+    paddingTop: 6,
   },
   recordButton: {
     justifyContent: "center",
@@ -817,7 +1234,7 @@ const styles = StyleSheet.create({
     backgroundColor: theme.accentSoft,
     borderWidth: 2,
     borderColor: theme.accent,
-    marginBottom: 18,
+    marginBottom: 20,
   },
   recordButtonActive: {
     backgroundColor: theme.dangerSoft,
@@ -925,6 +1342,122 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     marginBottom: 18,
+  },
+  historyCard: {
+    backgroundColor: theme.surface,
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: 22,
+    paddingHorizontal: 16,
+    paddingVertical: 16,
+    marginBottom: 18,
+  },
+  historyHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    marginBottom: 14,
+  },
+  historyTitle: {
+    color: theme.text,
+    fontSize: 18,
+    fontWeight: "800",
+    marginBottom: 4,
+  },
+  historySubtitle: {
+    color: theme.textSecondary,
+    fontSize: 12,
+    lineHeight: 18,
+    maxWidth: 240,
+  },
+  historyCountBadge: {
+    minWidth: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: theme.accentSoft,
+    borderWidth: 1,
+    borderColor: theme.accent + "55",
+    justifyContent: "center",
+    alignItems: "center",
+    paddingHorizontal: 10,
+  },
+  historyCountText: {
+    color: theme.accentStrong,
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  historyEmptyState: {
+    backgroundColor: theme.surfaceRaised,
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: 18,
+    padding: 16,
+  },
+  historyEmptyTitle: {
+    color: theme.text,
+    fontSize: 15,
+    fontWeight: "700",
+    marginBottom: 6,
+  },
+  historyEmptyText: {
+    color: theme.textSecondary,
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  historyList: {
+    gap: 12,
+  },
+  historyRow: {
+    backgroundColor: theme.surfaceRaised,
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: 18,
+    padding: 14,
+  },
+  historyRowTop: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 10,
+  },
+  historyFilename: {
+    color: theme.text,
+    fontSize: 14,
+    fontWeight: "700",
+    flex: 1,
+    marginRight: 10,
+  },
+  historyDate: {
+    color: theme.textMuted,
+    fontSize: 11,
+    fontWeight: "600",
+  },
+  historyMetaRow: {
+    flexDirection: "row",
+    marginBottom: 10,
+  },
+  historyMetaBadge: {
+    backgroundColor: theme.track,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    marginRight: 8,
+  },
+  historyMetaText: {
+    color: theme.textSecondary,
+    fontSize: 11,
+    fontWeight: "700",
+  },
+  historyPreview: {
+    color: theme.text,
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 8,
+  },
+  historySummaryPreview: {
+    color: theme.textSecondary,
+    fontSize: 12,
+    lineHeight: 18,
   },
   uploadCardDisabled: {
     opacity: 0.5,
@@ -1116,6 +1649,30 @@ const styles = StyleSheet.create({
   resultScroll: {
     flex: 1,
     paddingHorizontal: 16,
+  },
+  playbackButton: {
+    alignSelf: "flex-start",
+    backgroundColor: theme.accentSoft,
+    borderWidth: 1,
+    borderColor: theme.accent + "55",
+    borderRadius: 999,
+    paddingHorizontal: 16,
+    paddingVertical: 11,
+    marginBottom: 18,
+  },
+  playbackButtonText: {
+    color: theme.accentStrong,
+    fontSize: 13,
+    fontWeight: "800",
+    letterSpacing: 0.2,
+  },
+  playbackNotice: {
+    marginBottom: 18,
+  },
+  playbackNoticeText: {
+    color: theme.textMuted,
+    fontSize: 13,
+    lineHeight: 19,
   },
   metaRow: {
     flexDirection: "row",

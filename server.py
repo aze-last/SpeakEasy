@@ -31,6 +31,7 @@ app.add_middleware(
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 OLLAMA_MODEL_FALLBACKS = ["qwen2.5:7b", "qwen2.5", "qwen2.5:3b"]
+OLLAMA_TIMEOUT_SECONDS = 600.0
 WHISPER_MODEL_SIZE = "large-v3"    # Options: tiny, base, small, medium, large-v3
 USE_GPU = bool(torch.cuda.is_available())
 
@@ -99,6 +100,7 @@ class TranscribeResponse(BaseModel):
 class SummaryResponse(BaseModel):
     success: bool
     summary: str
+    key_points: list[str]
     action_items: list[str]
     raw: str
 
@@ -150,7 +152,9 @@ async def transcribe_audio(file: UploadFile = File(...)):
             tmp_path,
             task="transcribe",
             language=None,          # Auto-detect language
-            word_timestamps=True,
+            # Segment timestamps are enough for the app timeline. Word-level
+            # alignment is much slower on this machine and is not used.
+            word_timestamps=False,
             verbose=False
         )
 
@@ -167,14 +171,16 @@ async def transcribe_audio(file: UploadFile = File(...)):
                 "text": seg["text"].strip()
             })
 
-        print(f"Transcribed. Language: {detected_lang} | Duration: {result.get('duration', 0):.1f}s")
+        duration_seconds = float(result.get("duration") or (segments[-1]["end"] if segments else 0))
+
+        print(f"Transcribed. Language: {detected_lang} | Duration: {duration_seconds:.1f}s")
 
         return TranscribeResponse(
             success=True,
             transcript=result["text"].strip(),
             language=detected_lang,
             language_probability=round(float(lang_prob), 4),
-            duration=round(float(result.get("duration", 0)), 2),
+            duration=round(duration_seconds, 2),
             segments=segments
         )
 
@@ -213,11 +219,13 @@ Transcript:
 
 Please provide:
 1. A clear SUMMARY of the main feedback points (3-5 sentences max, in English)
-2. A list of ACTION ITEMS — specific things the student needs to add, fix, or change
+2. A list of KEY POINTS - the most important feedback details in short bullets
+3. A list of ACTION ITEMS - specific things the student needs to add, fix, or change
 
 Respond ONLY in this exact JSON format, no extra text:
 {{
   "summary": "...",
+  "key_points": ["point 1", "point 2", "point 3"],
   "action_items": ["item 1", "item 2", "item 3"]
 }}"""
 
@@ -227,7 +235,7 @@ Respond ONLY in this exact JSON format, no extra text:
         response = None
         selected_model = None
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SECONDS) as client:
             for model_name in get_ollama_model_candidates():
                 print(f"Trying Ollama model: {model_name}")
                 response = await client.post(
@@ -282,6 +290,7 @@ Respond ONLY in this exact JSON format, no extra text:
             return SummaryResponse(
                 success=True,
                 summary=parsed.get("summary", ""),
+                key_points=parsed.get("key_points", []),
                 action_items=parsed.get("action_items", []),
                 raw=raw_response
             )
@@ -290,6 +299,7 @@ Respond ONLY in this exact JSON format, no extra text:
             return SummaryResponse(
                 success=True,
                 summary=raw_response,
+                key_points=[],
                 action_items=[],
                 raw=raw_response
             )
@@ -331,6 +341,7 @@ async def transcribe_and_summarize(file: UploadFile = File(...)):
         },
         "summary": {
             "text": summary_result.summary,
+            "key_points": summary_result.key_points,
             "action_items": summary_result.action_items
         }
     }
