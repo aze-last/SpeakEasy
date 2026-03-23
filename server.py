@@ -11,7 +11,7 @@ import json
 import shutil
 import tempfile
 import httpx
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import whisper
@@ -29,9 +29,11 @@ app.add_middleware(
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_TAGS_URL = "http://localhost:11434/api/tags"
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 OLLAMA_MODEL_FALLBACKS = ["qwen2.5:7b", "qwen2.5", "qwen2.5:3b"]
 OLLAMA_TIMEOUT_SECONDS = 600.0
+OLLAMA_KV_CACHE_TYPE = os.getenv("OLLAMA_KV_CACHE_TYPE") or None
 WHISPER_MODEL_SIZE = "large-v3"    # Options: tiny, base, small, medium, large-v3
 USE_GPU = bool(torch.cuda.is_available())
 
@@ -75,7 +77,10 @@ whisper_model = whisper.load_model(
 print("Whisper model loaded and ready!")
 
 
-def get_ollama_model_candidates():
+def get_ollama_model_candidates(requested_model: str | None = None):
+    if requested_model and requested_model.strip():
+        return [requested_model.strip()]
+
     candidates = []
 
     for name in [OLLAMA_MODEL, *OLLAMA_MODEL_FALLBACKS]:
@@ -84,10 +89,31 @@ def get_ollama_model_candidates():
 
     return candidates
 
+
+async def get_installed_ollama_models():
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(OLLAMA_TAGS_URL)
+            response.raise_for_status()
+            payload = response.json()
+            models = [
+                item.get("name")
+                for item in payload.get("models", [])
+                if item.get("name")
+            ]
+
+            if models:
+                return models
+    except Exception as error:
+        print(f"Could not load Ollama model list: {error}")
+
+    return get_ollama_model_candidates()
+
 # ─── MODELS ──────────────────────────────────────────────────────────────────
 class SummaryRequest(BaseModel):
     transcript: str
     context: str = "teacher feedback on student project"
+    model: str | None = None
 
 class TranscribeResponse(BaseModel):
     success: bool
@@ -102,6 +128,8 @@ class SummaryResponse(BaseModel):
     summary: str
     key_points: list[str]
     action_items: list[str]
+    model: str | None = None
+    kv_cache_type: str | None = None
     raw: str
 
 # ─── ROUTES ──────────────────────────────────────────────────────────────────
@@ -119,7 +147,23 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "gpu": USE_GPU, "ffmpeg_available": bool(FFMPEG_PATH)}
+    return {
+        "status": "ok",
+        "gpu": USE_GPU,
+        "ffmpeg_available": bool(FFMPEG_PATH),
+        "default_summary_model": OLLAMA_MODEL,
+        "ollama_kv_cache_type": OLLAMA_KV_CACHE_TYPE,
+    }
+
+
+@app.get("/config")
+async def config():
+    return {
+        "default_summary_model": OLLAMA_MODEL,
+        "summary_model_candidates": get_ollama_model_candidates(),
+        "available_summary_models": await get_installed_ollama_models(),
+        "ollama_kv_cache_type": OLLAMA_KV_CACHE_TYPE,
+    }
 
 
 @app.post("/transcribe", response_model=TranscribeResponse)
@@ -236,7 +280,7 @@ Respond ONLY in this exact JSON format, no extra text:
         selected_model = None
 
         async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SECONDS) as client:
-            for model_name in get_ollama_model_candidates():
+            for model_name in get_ollama_model_candidates(req.model):
                 print(f"Trying Ollama model: {model_name}")
                 response = await client.post(
                     OLLAMA_URL,
@@ -265,6 +309,15 @@ Respond ONLY in this exact JSON format, no extra text:
                 break
 
         if not response or not selected_model:
+            if req.model:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f'Requested Ollama model "{req.model}" was not found. '
+                        f'Install it with: ollama pull {req.model}'
+                    ),
+                )
+
             raise HTTPException(
                 status_code=503,
                 detail=(
@@ -292,6 +345,8 @@ Respond ONLY in this exact JSON format, no extra text:
                 summary=parsed.get("summary", ""),
                 key_points=parsed.get("key_points", []),
                 action_items=parsed.get("action_items", []),
+                model=selected_model,
+                kv_cache_type=OLLAMA_KV_CACHE_TYPE,
                 raw=raw_response
             )
         except json.JSONDecodeError:
@@ -301,6 +356,8 @@ Respond ONLY in this exact JSON format, no extra text:
                 summary=raw_response,
                 key_points=[],
                 action_items=[],
+                model=selected_model,
+                kv_cache_type=OLLAMA_KV_CACHE_TYPE,
                 raw=raw_response
             )
 
@@ -315,7 +372,10 @@ Respond ONLY in this exact JSON format, no extra text:
 
 
 @app.post("/transcribe-and-summarize")
-async def transcribe_and_summarize(file: UploadFile = File(...)):
+async def transcribe_and_summarize(
+    file: UploadFile = File(...),
+    summary_model: str | None = Form(None),
+):
     """
     One-shot endpoint: transcribe + summarize in a single call.
     This is what the mobile app uses.
@@ -328,7 +388,10 @@ async def transcribe_and_summarize(file: UploadFile = File(...)):
 
     # Step 2: Summarize
     summary_result = await summarize_transcript(
-        SummaryRequest(transcript=transcribe_result.transcript)
+        SummaryRequest(
+            transcript=transcribe_result.transcript,
+            model=summary_model,
+        )
     )
 
     return {
@@ -342,6 +405,8 @@ async def transcribe_and_summarize(file: UploadFile = File(...)):
         "summary": {
             "text": summary_result.summary,
             "key_points": summary_result.key_points,
-            "action_items": summary_result.action_items
+            "action_items": summary_result.action_items,
+            "model": summary_result.model,
+            "kv_cache_type": summary_result.kv_cache_type,
         }
     }

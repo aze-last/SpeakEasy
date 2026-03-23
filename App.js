@@ -16,11 +16,13 @@ import {
 import { Audio } from "expo-av";
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
+import * as Sharing from "expo-sharing";
 
 const SERVER_URL = "http://192.168.254.194:8000";
 const SERVER_HEALTH_TIMEOUT_MS = 5000;
 const SERVER_BOOT_TIMEOUT_MS = 60000;
 const SERVER_RETRY_DELAY_MS = 3000;
+const CONFIG_REQUEST_TIMEOUT_MS = 10000;
 const TRANSCRIBE_AND_SUMMARIZE_TIMEOUT_MS = 30 * 60 * 1000;
 const HISTORY_FILE_URI = FileSystem.documentDirectory
   ? `${FileSystem.documentDirectory}speak-easy-history.json`
@@ -29,6 +31,7 @@ const AUDIO_HISTORY_DIR_URI = FileSystem.documentDirectory
   ? `${FileSystem.documentDirectory}speak-easy-audio`
   : null;
 const MAX_HISTORY_ITEMS = 20;
+const DEFAULT_SUMMARY_MODELS = ["qwen3:8b", "qwen2.5:7b"];
 
 const theme = {
   bg: "#0A0A0F",
@@ -131,6 +134,26 @@ function normalizeActionItems(items) {
 
 function normalizeKeyPoints(items) {
   return normalizeActionItems(items);
+}
+
+function mergeModelOptions(...lists) {
+  const merged = [];
+
+  lists.forEach((list) => {
+    if (!Array.isArray(list)) {
+      return;
+    }
+
+    list.forEach((item) => {
+      const value = String(item || "").trim();
+
+      if (value && !merged.includes(value)) {
+        merged.push(value);
+      }
+    });
+  });
+
+  return merged;
 }
 
 function normalizeErrorMessage(error) {
@@ -290,6 +313,8 @@ function createHistoryEntry(result, filename, audioUri = null) {
       text: summary.text || "",
       key_points: normalizeKeyPoints(summary.key_points),
       action_items: normalizeActionItems(summary.action_items),
+      model: summary.model || "",
+      kv_cache_type: summary.kv_cache_type || null,
     },
   };
 }
@@ -329,6 +354,133 @@ async function saveHistoryEntries(items) {
   }
 
   await FileSystem.writeAsStringAsync(HISTORY_FILE_URI, JSON.stringify(items));
+}
+
+async function loadBackendConfig() {
+  const fallbackModels = [...DEFAULT_SUMMARY_MODELS];
+
+  try {
+    const response = await fetchWithTimeout(
+      `${SERVER_URL}/config`,
+      { method: "GET" },
+      CONFIG_REQUEST_TIMEOUT_MS
+    );
+    const payload = await readResponseBody(response);
+
+    if (!response.ok) {
+      throw new Error(getResponseErrorMessage(payload, response.status));
+    }
+
+    const models = mergeModelOptions(
+      payload?.available_summary_models,
+      payload?.summary_model_candidates,
+      fallbackModels
+    );
+    const defaultModel = String(payload?.default_summary_model || "").trim();
+
+    return {
+      models: models.length > 0 ? models : fallbackModels,
+      defaultModel: defaultModel || models[0] || fallbackModels[0],
+      kvCacheType: payload?.ollama_kv_cache_type || null,
+    };
+  } catch {
+    return {
+      models: fallbackModels,
+      defaultModel: fallbackModels[0],
+      kvCacheType: null,
+    };
+  }
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderDocumentList(items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return "<p class=\"muted\">None</p>";
+  }
+
+  return `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
+}
+
+function buildResultDocumentHtml(result) {
+  const transcription = result?.transcription || {};
+  const summary = result?.summary || {};
+  const keyPoints = normalizeKeyPoints(summary.key_points);
+  const actionItems = normalizeActionItems(summary.action_items);
+  const generatedAt = new Date().toLocaleString();
+  const durationLabel = formatDuration(Math.round(transcription.duration || 0));
+
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>SpeakEasy Export</title>
+    <style>
+      body { font-family: Calibri, Arial, sans-serif; color: #1f2937; margin: 40px; line-height: 1.55; }
+      h1, h2 { color: #111827; margin-bottom: 8px; }
+      .meta { margin: 0 0 24px; padding: 16px; background: #f3f4f6; border: 1px solid #e5e7eb; border-radius: 12px; }
+      .meta p { margin: 4px 0; }
+      .section { margin-bottom: 24px; padding: 20px; border: 1px solid #e5e7eb; border-radius: 14px; }
+      .muted { color: #6b7280; }
+      ul { margin: 0; padding-left: 22px; }
+      li { margin-bottom: 10px; }
+      .transcript { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>SpeakEasy Result Export</h1>
+    <div class="meta">
+      <p><strong>Generated:</strong> ${escapeHtml(generatedAt)}</p>
+      <p><strong>Language:</strong> ${escapeHtml(getLanguageLabel(transcription.language))}</p>
+      <p><strong>Duration:</strong> ${escapeHtml(durationLabel)}</p>
+      <p><strong>Model:</strong> ${escapeHtml(summary.model || "Unknown")}</p>
+      <p><strong>KV Cache:</strong> ${escapeHtml(summary.kv_cache_type || "Default")}</p>
+    </div>
+
+    <div class="section">
+      <h2>Summary</h2>
+      <p>${escapeHtml(summary.text || "No summary available.")}</p>
+    </div>
+
+    <div class="section">
+      <h2>Key Points</h2>
+      ${renderDocumentList(keyPoints)}
+    </div>
+
+    <div class="section">
+      <h2>Action Items</h2>
+      ${renderDocumentList(actionItems)}
+    </div>
+
+    <div class="section">
+      <h2>Transcript</h2>
+      <div class="transcript">${escapeHtml(transcription.text || "No transcript available.")}</div>
+    </div>
+  </body>
+</html>`;
+}
+
+async function createResultDocument(result) {
+  if (!FileSystem.documentDirectory) {
+    throw new Error("Document storage is unavailable on this device.");
+  }
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const fileUri = `${FileSystem.documentDirectory}speak-easy-result-${timestamp}.doc`;
+  const content = buildResultDocumentHtml(result);
+
+  await FileSystem.writeAsStringAsync(fileUri, content, {
+    encoding: FileSystem.EncodingType.UTF8,
+  });
+
+  return fileUri;
 }
 
 function ProcessingScreen({ step }) {
@@ -406,9 +558,13 @@ function ResultScreen({ result, onBack }) {
   const summary = result?.summary || {};
   const keyPoints = normalizeKeyPoints(summary.key_points);
   const actionItems = normalizeActionItems(summary.action_items);
+  const summaryModel = String(summary.model || "").trim();
+  const summaryKvCacheType = String(summary.kv_cache_type || "").trim();
   const segments = Array.isArray(transcription.segments) ? transcription.segments : [];
+  const resultHeaderTopInset = Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 10 : 12;
   const [isPlayingAudio, setIsPlayingAudio] = useState(false);
   const [isLoadingAudio, setIsLoadingAudio] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
   const soundRef = useRef(null);
   const hasSavedAudio = Boolean(result?.audioUri);
 
@@ -490,11 +646,36 @@ function ResultScreen({ result, onBack }) {
     }
   };
 
+  const exportDocument = async () => {
+    if (isExporting) {
+      return;
+    }
+
+    try {
+      setIsExporting(true);
+      const fileUri = await createResultDocument(result);
+
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(fileUri, {
+          mimeType: "application/msword",
+          dialogTitle: "Export SpeakEasy document",
+          UTI: "com.microsoft.word.doc",
+        });
+      } else {
+        Alert.alert("Document ready", `Saved to:\n\n${fileUri}`);
+      }
+    } catch (error) {
+      Alert.alert("Export error", `Could not create the document.\n\n${normalizeErrorMessage(error)}`);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle="light-content" backgroundColor={theme.bg} />
 
-      <View style={styles.resultHeader}>
+      <View style={[styles.resultHeader, { paddingTop: resultHeaderTopInset }]}>
         <TouchableOpacity style={styles.backButton} onPress={onBack}>
           <Text style={styles.backButtonText}>New recording</Text>
         </TouchableOpacity>
@@ -512,6 +693,16 @@ function ResultScreen({ result, onBack }) {
               {formatDuration(Math.round(transcription.duration || 0))}
             </Text>
           </View>
+          {summaryModel ? (
+            <View style={styles.metaBadge}>
+              <Text style={styles.metaBadgeText}>{summaryModel}</Text>
+            </View>
+          ) : null}
+          {summaryKvCacheType ? (
+            <View style={styles.metaBadge}>
+              <Text style={styles.metaBadgeText}>KV {summaryKvCacheType}</Text>
+            </View>
+          ) : null}
         </View>
 
         {hasSavedAudio ? (
@@ -535,6 +726,16 @@ function ResultScreen({ result, onBack }) {
             </Text>
           </View>
         )}
+
+        <TouchableOpacity
+          style={styles.exportButton}
+          onPress={exportDocument}
+          activeOpacity={0.85}
+        >
+          <Text style={styles.exportButtonText}>
+            {isExporting ? "Creating document..." : "Export Word document"}
+          </Text>
+        </TouchableOpacity>
 
         <View style={styles.resultCard}>
           <View style={styles.cardHeader}>
@@ -631,6 +832,10 @@ export default function App() {
   const [recordingDuration, setRecordingDuration] = useState(0);
   const [result, setResult] = useState(null);
   const [history, setHistory] = useState([]);
+  const [availableSummaryModels, setAvailableSummaryModels] = useState(DEFAULT_SUMMARY_MODELS);
+  const [selectedSummaryModel, setSelectedSummaryModel] = useState(DEFAULT_SUMMARY_MODELS[0]);
+  const [ollamaKvCacheType, setOllamaKvCacheType] = useState(null);
+  const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
 
   const recordingRef = useRef(null);
   const timerRef = useRef(null);
@@ -722,6 +927,32 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let isActive = true;
+
+    loadBackendConfig()
+      .then((config) => {
+        if (!isActive) {
+          return;
+        }
+
+        setAvailableSummaryModels(config.models);
+        setSelectedSummaryModel((current) => {
+          if (current && config.models.includes(current)) {
+            return current;
+          }
+
+          return config.defaultModel || config.models[0] || DEFAULT_SUMMARY_MODELS[0];
+        });
+        setOllamaKvCacheType(config.kvCacheType || null);
+      })
+      .catch(() => undefined);
+
+    return () => {
+      isActive = false;
+    };
+  }, []);
+
   const processAudio = async (uri, filename) => {
     setResult(null);
     setScreen("home");
@@ -770,6 +1001,10 @@ export default function App() {
         name: filename,
         type: getMimeType(filename),
       });
+
+      if (selectedSummaryModel) {
+        formData.append("summary_model", selectedSummaryModel);
+      }
 
       setProcessingStep("Uploading and transcribing");
 
@@ -929,6 +1164,7 @@ export default function App() {
     setProcessingStep("");
     setRecordingDuration(0);
     setResult(null);
+    setIsModelMenuOpen(false);
     setScreen("home");
   };
 
@@ -969,6 +1205,61 @@ export default function App() {
             <Text style={styles.heroSubtitle}>
               Record your teacher&apos;s feedback, then get a clean transcript, summary, and action items in one place.
             </Text>
+          </View>
+
+          <View style={styles.modelCard}>
+            <Text style={styles.sectionEyebrow}>Summary model</Text>
+            <TouchableOpacity
+              style={styles.modelSelector}
+              onPress={() => setIsModelMenuOpen((current) => !current)}
+              activeOpacity={0.88}
+            >
+              <View style={styles.modelSelectorCopy}>
+                <Text style={styles.modelSelectorLabel}>Chosen model</Text>
+                <Text style={styles.modelSelectorValue}>{selectedSummaryModel}</Text>
+              </View>
+              <Text style={styles.modelSelectorAction}>
+                {isModelMenuOpen ? "Hide" : "Choose"}
+              </Text>
+            </TouchableOpacity>
+
+            <Text style={styles.modelRuntimeText}>
+              {ollamaKvCacheType
+                ? `KV cache experiment active: ${ollamaKvCacheType}`
+                : "KV cache experiment is not enabled in the current backend session."}
+            </Text>
+
+            {isModelMenuOpen ? (
+              <View style={styles.modelOptionsList}>
+                {availableSummaryModels.map((modelName) => {
+                  const isSelected = modelName === selectedSummaryModel;
+
+                  return (
+                    <TouchableOpacity
+                      key={modelName}
+                      style={[
+                        styles.modelOptionButton,
+                        isSelected && styles.modelOptionButtonSelected,
+                      ]}
+                      onPress={() => {
+                        setSelectedSummaryModel(modelName);
+                        setIsModelMenuOpen(false);
+                      }}
+                      activeOpacity={0.88}
+                    >
+                      <Text
+                        style={[
+                          styles.modelOptionText,
+                          isSelected && styles.modelOptionTextSelected,
+                        ]}
+                      >
+                        {modelName}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            ) : null}
           </View>
 
           <View style={styles.recordPanel}>
@@ -1101,6 +1392,18 @@ export default function App() {
                           {formatDuration(Math.round(item?.transcription?.duration || 0))}
                         </Text>
                       </View>
+                      {item?.summary?.model ? (
+                        <View style={styles.historyMetaBadge}>
+                          <Text style={styles.historyMetaText}>{item.summary.model}</Text>
+                        </View>
+                      ) : null}
+                      {item?.summary?.kv_cache_type ? (
+                        <View style={styles.historyMetaBadge}>
+                          <Text style={styles.historyMetaText}>
+                            KV {item.summary.kv_cache_type}
+                          </Text>
+                        </View>
+                      ) : null}
                     </View>
 
                     <Text style={styles.historyPreview} numberOfLines={2}>
@@ -1204,6 +1507,80 @@ const styles = StyleSheet.create({
     color: theme.textSecondary,
     fontSize: 15,
     lineHeight: 22,
+  },
+  modelCard: {
+    backgroundColor: theme.surface,
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: 24,
+    paddingHorizontal: 18,
+    paddingTop: 16,
+    paddingBottom: 18,
+    marginBottom: 22,
+  },
+  modelSelector: {
+    backgroundColor: theme.surfaceRaised,
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: 18,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  modelSelectorCopy: {
+    flex: 1,
+    paddingRight: 12,
+  },
+  modelSelectorLabel: {
+    color: theme.textMuted,
+    fontSize: 11,
+    fontWeight: "700",
+    textTransform: "uppercase",
+    letterSpacing: 0.9,
+    marginBottom: 6,
+  },
+  modelSelectorValue: {
+    color: theme.text,
+    fontSize: 16,
+    fontWeight: "800",
+  },
+  modelSelectorAction: {
+    color: theme.accentStrong,
+    fontSize: 12,
+    fontWeight: "800",
+    letterSpacing: 0.4,
+  },
+  modelRuntimeText: {
+    color: theme.textSecondary,
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 12,
+  },
+  modelOptionsList: {
+    gap: 10,
+    marginTop: 14,
+  },
+  modelOptionButton: {
+    backgroundColor: theme.surfaceRaised,
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  modelOptionButtonSelected: {
+    borderColor: theme.accent + "88",
+    backgroundColor: theme.accentSoft,
+  },
+  modelOptionText: {
+    color: theme.textSecondary,
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  modelOptionTextSelected: {
+    color: theme.text,
   },
   recordPanel: {
     backgroundColor: theme.surface,
@@ -1434,6 +1811,7 @@ const styles = StyleSheet.create({
   },
   historyMetaRow: {
     flexDirection: "row",
+    flexWrap: "wrap",
     marginBottom: 10,
   },
   historyMetaBadge: {
@@ -1442,6 +1820,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 5,
     marginRight: 8,
+    marginBottom: 8,
   },
   historyMetaText: {
     color: theme.textSecondary,
@@ -1626,12 +2005,13 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: 16,
-    paddingVertical: 12,
+    paddingBottom: 12,
     borderBottomWidth: 1,
     borderBottomColor: theme.border,
   },
   backButton: {
-    width: 110,
+    width: 126,
+    paddingVertical: 8,
   },
   backButtonText: {
     color: theme.accentStrong,
@@ -1644,7 +2024,7 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
   resultHeaderSpacer: {
-    width: 110,
+    width: 126,
   },
   resultScroll: {
     flex: 1,
@@ -1674,8 +2054,25 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
   },
+  exportButton: {
+    alignSelf: "flex-start",
+    backgroundColor: theme.surfaceRaised,
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: 999,
+    paddingHorizontal: 16,
+    paddingVertical: 11,
+    marginBottom: 18,
+  },
+  exportButtonText: {
+    color: theme.text,
+    fontSize: 13,
+    fontWeight: "800",
+    letterSpacing: 0.2,
+  },
   metaRow: {
     flexDirection: "row",
+    flexWrap: "wrap",
     marginTop: 16,
     marginBottom: 12,
   },
@@ -1687,6 +2084,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 6,
     marginRight: 8,
+    marginBottom: 8,
   },
   metaBadgeText: {
     color: theme.accentStrong,
